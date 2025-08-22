@@ -1,5 +1,5 @@
 streamlit>=1.48.0
-pinecone-client
+pinecone-client==2.2.4
 pandas>=2.2.3
 numpy>=1.26.4
 plotly>=6.2.0
