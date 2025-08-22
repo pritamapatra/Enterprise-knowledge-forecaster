@@ -21,7 +21,7 @@ import tempfile
 import os
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import Pinecone
-import pinecone
+from pinecone import pinecone
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 import json
@@ -100,10 +100,9 @@ if 'entities' not in st.session_state:
 def initialize_pinecone():
     """Initialize Pinecone vector database"""
     try:
-        pinecone.init(
-            api_key=os.getenv("PINECONE_API_KEY", "pcsk_3CwtHw_9Zw6NTWL64SryXCZLLS8BreatEH46i5uJLCm6F5jwYpnS93WsT4DWN2roYaXnCC"),
-            environment=os.getenv("PINECONE_ENVIRONMENT", "us-west1-gcp")
-        )
+    pc = Pinecone(
+        api_key=os.getenv("PINECONE_API_KEY", "pcsk_3CwtHw_9Zw6NTWL64SryXCZLLS8BreatEH46i5uJLCm6F5jwYpnS93WsT4DWN2roYaXnCC")
+    )
         
         embeddings = OpenAIEmbeddings()
         index_name = "enterprise-knowledge"
@@ -115,7 +114,8 @@ def initialize_pinecone():
                 dimension=1536,  # OpenAI embedding dimension
                 metric="cosine"
             )
-        
+        index = pc.Index(index_name)
+
         vectorstore = Pinecone(
             index_name=index_name,
             embedding_function=embeddings
