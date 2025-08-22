@@ -4,6 +4,7 @@ try:
     sys.modules['sqlite3'] = pysqlite3
 except ImportError:
     import sqlite3
+
 import streamlit as st
 import pandas as pd
 import networkx as nx
@@ -13,14 +14,16 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import requests
-import chromadb
-from chromadb.config import Settings
 import PyPDF2
 import docx
 from io import BytesIO
 import tempfile
 import os
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+import pinecone
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 import json
 import re
 import plotly
@@ -76,10 +79,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize session state for document processing and RAG
-if 'chroma_client' not in st.session_state:
-    st.session_state.chroma_client = None
-if 'collection' not in st.session_state:
-    st.session_state.collection = None
+if 'vectorstore' not in st.session_state:
+    st.session_state.vectorstore = None
 if 'embedding_model' not in st.session_state:
     st.session_state.embedding_model = None
 if 'document_processed' not in st.session_state:
@@ -89,20 +90,41 @@ if 'query_input' not in st.session_state:
 if 'workflow_results' not in st.session_state:
     st.session_state.workflow_results = []
 
+# Initialize session state for knowledge graph
+if 'knowledge_graph' not in st.session_state:
+    st.session_state.knowledge_graph = nx.Graph()
+if 'entities' not in st.session_state:
+    st.session_state.entities = {'PERSON': set(), 'PROJECT': set(), 'SKILL': set()}
+
 @st.cache_resource
-def initialize_chromadb():
-    """Initialize ChromaDB with robust error handling"""
+def initialize_pinecone():
+    """Initialize Pinecone vector database"""
     try:
-        client = chromadb.PersistentClient(path="./chroma_db")
-        embedding_model = None
-        return client, embedding_model, "ChromaDB Active (Persistent - Default Embeddings)"
+        pinecone.init(
+            api_key=os.getenv("PINECONE_API_KEY", "pcsk_3CwtHw_9Zw6NTWL64SryXCZLLS8BreatEH46i5uJLCm6F5jwYpnS93WsT4DWN2roYaXnCC"),
+            environment=os.getenv("PINECONE_ENVIRONMENT", "us-west1-gcp")
+        )
+        
+        embeddings = OpenAIEmbeddings()
+        index_name = "enterprise-knowledge"
+        
+        # Create index if it doesn't exist
+        if index_name not in pinecone.list_indexes():
+            pinecone.create_index(
+                name=index_name,
+                dimension=1536,  # OpenAI embedding dimension
+                metric="cosine"
+            )
+        
+        vectorstore = Pinecone(
+            index_name=index_name,
+            embedding_function=embeddings
+        )
+        
+        return vectorstore, embeddings, "Pinecone Active"
+        
     except Exception as e:
-        try:
-            client = chromadb.Client()
-            embedding_model = None
-            return client, embedding_model, "ChromaDB Active (Ephemeral - Default Embeddings)"
-        except Exception as e2:
-            return None, None, f"ChromaDB Error: {str(e2)}"
+        return None, None, f"Pinecone Error: {str(e)}"
 
 def extract_pdf_text(uploaded_file):
     """Extract text from PDF file"""
@@ -209,9 +231,10 @@ def generate_fallback_answer(query, context):
     
     return "I couldn't find specific information to answer your question in the uploaded document. Please try rephrasing your question or check if the relevant information is included in the document."
 
-def process_uploaded_file(uploaded_file, client, embedding_model):
-    """Process uploaded file and store in ChromaDB with better chunking"""
+def process_uploaded_file(uploaded_file, vectorstore, embedding_model):
+    """Process uploaded file and store in Pinecone"""
     try:
+        # Extract text based on file type
         if uploaded_file.type == "application/pdf":
             text = extract_pdf_text(uploaded_file)
         elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -224,6 +247,7 @@ def process_uploaded_file(uploaded_file, client, embedding_model):
         if not text.strip():
             return "No text found in document"
 
+        # Split text into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
             chunk_overlap=300,
@@ -232,52 +256,49 @@ def process_uploaded_file(uploaded_file, client, embedding_model):
         
         chunks = text_splitter.split_text(text)
         
-        collection_name = "uploaded_documents"
-        try:
-            client.delete_collection(collection_name)
-        except:
-            pass
-        
-        collection = client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        
-        for i, chunk in enumerate(chunks):
-            collection.add(
-                documents=[chunk],
-                metadatas=[{
+        # Create documents for Pinecone
+        documents = [
+            Document(
+                page_content=chunk,
+                metadata={
                     "source": uploaded_file.name,
                     "chunk_id": i,
                     "chunk_size": len(chunk)
-                }],
-                ids=[f"doc_{i}"]
+                }
             )
-
-        st.session_state.collection = collection
+            for i, chunk in enumerate(chunks)
+        ]
+        
+        # Add to Pinecone
+        vectorstore.add_documents(documents)
+        
+        # Build knowledge graph from document text
+        build_knowledge_graph(text)
+        
+        st.session_state.vectorstore = vectorstore
         st.session_state.document_processed = True
         
-        return f"Document processed successfully. {len(chunks)} sections indexed."
+        return f"Document processed successfully. {len(chunks)} sections indexed in Pinecone."
         
     except Exception as e:
         return f"Error processing document: {str(e)}"
 
 def query_rag_system(query):
-    """Query the RAG system and return direct answer without showing sources"""
-    if not st.session_state.collection:
+    """Query the Pinecone RAG system"""
+    if not st.session_state.vectorstore:
         return "No document has been uploaded and processed yet."
     
     try:
-        results = st.session_state.collection.query(
-            query_texts=[query],
-            n_results=5,
-            include=['documents', 'metadatas']
-        )
+        # Query Pinecone for relevant context
+        results = st.session_state.vectorstore.similarity_search(query, k=5)
         
-        if not results['documents'][0]:
+        if not results:
             return "No relevant information found in the uploaded document."
         
-        context = "\n".join(results['documents'][0])
+        # Combine retrieved context
+        context = "\n".join([doc.page_content for doc in results])
+        
+        # Generate answer using LM Studio
         answer = generate_direct_answer(query, context)
         return answer
         
@@ -298,12 +319,6 @@ def load_ibm_dataset():
         except FileNotFoundError:
             st.error("No IBM dataset found. Please upload your enterprise data files for authentic analysis.")
             return None
-
-# Initialize session state for knowledge graph
-if 'knowledge_graph' not in st.session_state:
-    st.session_state.knowledge_graph = nx.Graph()
-if 'entities' not in st.session_state:
-    st.session_state.entities = {'PERSON': set(), 'PROJECT': set(), 'SKILL': set()}
 
 def extract_entities_from_text(text):
     """Extract entities using simple pattern matching and NER"""
@@ -381,7 +396,7 @@ def visualize_knowledge_graph():
             edge_trace.append(go.Scatter(x=[x0, x1, None], y=[y0, y1, None],
                                        mode='lines', line=dict(width=1, color='#888'),
                                        hoverinfo='none', showlegend=False))
-        except KeyError as e:
+        except KeyError:
             continue
 
     node_traces = {}
@@ -451,14 +466,6 @@ def show_knowledge_graph():
         st.info("**Please upload and process a document first to build the knowledge graph.**")
         st.markdown("Go to 'Document Upload' section to upload your enterprise documents.")
         return
-    
-    if len(st.session_state.knowledge_graph.nodes()) == 0:
-        if st.session_state.collection:
-            with st.spinner("Building knowledge graph from your documents..."):
-                results = st.session_state.collection.get(include=['documents'])
-                all_text = ' '.join(results['documents'])
-                build_knowledge_graph(all_text)
-                st.success("Knowledge graph built successfully!")
     
     G = st.session_state.knowledge_graph
     col1, col2, col3, col4 = st.columns(4)
@@ -574,11 +581,8 @@ def show_agentic_ai_interface():
             if st.button("Run Agentic Workflow", type="primary"):
                 with st.spinner("Agents are working..."):
                     context = "Enterprise documents processed via RAG pipeline"
-                    if hasattr(st.session_state, 'document_processed') and st.session_state.document_processed:
-                        try:
-                            context += f" - {st.session_state.collection.count()} document chunks available"
-                        except:
-                            context += " - Documents available"
+                    if st.session_state.document_processed:
+                        context += " - Documents available in Pinecone vector store"
                     
                     results = run_agentic_workflow(context)
                     st.session_state.agentic_results = results
@@ -600,7 +604,6 @@ def show_agentic_ai_interface():
             st.subheader("Agent Workflow Results")
             results = st.session_state.agentic_results
             
-            # Add to main content display section after your existing results
             if "recruitment_proposals" in results:
                 st.subheader("Proactive Recruitment Proposals")
                 recruitment_data = results["recruitment_proposals"]
@@ -666,8 +669,8 @@ def show_document_upload_updated():
     st.header("Document Upload & Processing")
     st.markdown("Upload enterprise documents to enable RAG-powered analysis")
     
-    if st.session_state.chroma_client is None:
-        st.error("ChromaDB not initialized. Please refresh the page.")
+    if st.session_state.vectorstore is None:
+        st.error("Pinecone not initialized. Please refresh the page.")
         return
     
     uploaded_file = st.file_uploader(
@@ -684,7 +687,7 @@ def show_document_upload_updated():
             with st.spinner(f"Processing {uploaded_file.name}..."):
                 result_message = process_uploaded_file(
                     uploaded_file, 
-                    st.session_state.chroma_client,
+                    st.session_state.vectorstore,
                     st.session_state.embedding_model
                 )
                 
@@ -699,8 +702,7 @@ def show_document_upload_updated():
         
         if st.button("Reset Document"):
             try:
-                st.session_state.chroma_client.delete_collection("uploaded_documents")
-                st.session_state.collection = None
+                # Clear session state instead of deleting collection
                 st.session_state.document_processed = False
                 st.session_state.knowledge_graph.clear()
                 st.session_state.entities = {'PERSON': set(), 'PROJECT': set(), 'SKILL': set()}
@@ -737,126 +739,6 @@ def show_rag_interface_updated():
                     st.write(answer)
             else:
                 st.warning("Please enter a question")
-
-def main():
-    """Main application function"""
-    st.markdown('<h1 class="main-header">Enterprise Knowledge Evolution Forecaster</h1>', unsafe_allow_html=True)
-    
-    df = load_ibm_dataset()
-    
-    if df is None:
-        st.error("**No Enterprise Data Available**")
-        st.warning("This application requires authentic enterprise data to provide meaningful analysis.")
-        st.info("Please upload your enterprise documents using the Document Upload section to begin analysis.")
-        metrics = None
-    else:
-        metrics = calculate_investment_metrics(df)
-    
-    if st.session_state.chroma_client is None:
-        with st.spinner("Initializing ChromaDB..."):
-            client, embedding_model, status = initialize_chromadb()
-            st.session_state.chroma_client = client
-            st.session_state.embedding_model = embedding_model
-    
-    # Sidebar
-    st.sidebar.title("Navigation")
-    
-    st.sidebar.markdown("### System Status")
-    if st.session_state.chroma_client:
-        st.sidebar.success("Vector Database: ChromaDB Active")
-        if st.session_state.document_processed:
-            st.sidebar.success("Document: Processed and Ready")
-        else:
-            st.sidebar.info("Document: No document uploaded")
-    else:
-        st.sidebar.error("ChromaDB Initialization Failed")
-    
-    # LM Studio status check
-    try:
-        response = requests.get("http://127.0.0.1:1234/", timeout=2)
-        if response.status_code == 200:
-            st.sidebar.success("LM Studio: Connected (Llama 3.2 3B)")
-        else:
-            st.sidebar.warning("LM Studio: Server running but model not loaded")
-    except:
-        st.sidebar.error("LM Studio: Not connected")
-        st.sidebar.info("Please ensure LM Studio is running with Llama 3.2 3B model loaded")
-    
-    # Agent list in sidebar
-    st.sidebar.markdown("### Active Agents")
-    for agent in agents_info:
-        st.sidebar.write(f"• {agent['name']}: {agent['role']}")
-    
-    dashboard_section = st.sidebar.selectbox(
-        "Select Dashboard Section",
-        ["Executive Overview", "Risk Analysis", "Training Plans", "Agent Status", "RAG Query Interface", "Document Upload", "Knowledge Graph", "Agentic AI Workflow"]
-    )
-    
-    if df is not None:
-        st.sidebar.markdown("### Dataset Information")
-        st.sidebar.metric("Total Employees", f"{len(df):,}")
-        st.sidebar.metric("Departments", df['Department'].nunique())
-        st.sidebar.metric("Job Roles", df['JobRole'].nunique())
-    else:
-        st.sidebar.markdown("### Dataset Information")
-        st.sidebar.error("No enterprise data loaded")
-        st.sidebar.info("Upload documents to analyze")
-    
-    # Main content based on selection
-    if dashboard_section == "Executive Overview":
-        show_executive_overview(df, metrics)
-    elif dashboard_section == "Risk Analysis":
-        show_risk_analysis(df, metrics)
-    elif dashboard_section == "Training Plans":
-        show_training_plans(df, metrics)
-    elif dashboard_section == "Agent Status":
-        show_agent_status(df)
-    elif dashboard_section == "RAG Query Interface":
-        show_rag_interface_updated()
-    elif dashboard_section == "Document Upload":
-        show_document_upload_updated()
-    elif dashboard_section == "Knowledge Graph":
-        show_knowledge_graph()   
-    elif dashboard_section == "Agentic AI Workflow":
-        show_agentic_ai_interface()
-
-    # Add the new dashboard tabs for HR insights
-    st.markdown("---")
-    tab1, tab2, tab3 = st.tabs(["Main Dashboard", "Recruitment Hub", "Training Center"])
-
-    with tab2:
-        st.header("Recruitment Intelligence Hub")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Open Positions", "5", "+2")
-        with col2:
-            st.metric("Candidates Sourced", "23", "+8")
-        with col3:
-            st.metric("Time to Hire", "18 days", "-5")
-        
-        if st.session_state.workflow_results:
-            latest_result = st.session_state.workflow_results[-1]
-            if "recruitment_proposals" in latest_result:
-                st.subheader("Latest Recruitment Proposals")
-                st.json(latest_result["recruitment_proposals"])
-
-    with tab3:
-        st.header("Training & Development Center")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Active Programs", "12", "+3")
-        with col2:
-            st.metric("Employees Enrolled", "45", "+15")
-        with col3:
-            st.metric("Completion Rate", "87%", "+5%")
-        
-        if st.session_state.workflow_results:
-            latest_result = st.session_state.workflow_results[-1]
-            if "training_proposals" in latest_result:
-                st.subheader("Latest Training Proposals")
-                st.json(latest_result["training_proposals"])
 
 def show_executive_overview(df, metrics):
     """Display executive overview dashboard"""
@@ -996,6 +878,126 @@ def show_agent_status(df):
         st.metric("Knowledge Entities", len(st.session_state.knowledge_graph.nodes()))
     with col4:
         st.metric("System Health", "Optimal")
+
+def main():
+    """Main application function"""
+    st.markdown('<h1 class="main-header">Enterprise Knowledge Evolution Forecaster</h1>', unsafe_allow_html=True)
+    
+    df = load_ibm_dataset()
+    
+    if df is None:
+        st.error("**No Enterprise Data Available**")
+        st.warning("This application requires authentic enterprise data to provide meaningful analysis.")
+        st.info("Please upload your enterprise documents using the Document Upload section to begin analysis.")
+        metrics = None
+    else:
+        metrics = calculate_investment_metrics(df)
+    
+    if st.session_state.vectorstore is None:
+        with st.spinner("Initializing Pinecone..."):
+            vectorstore, embedding_model, status = initialize_pinecone()
+            st.session_state.vectorstore = vectorstore
+            st.session_state.embedding_model = embedding_model
+    
+    # Sidebar
+    st.sidebar.title("Navigation")
+    
+    st.sidebar.markdown("### System Status")
+    if st.session_state.vectorstore:
+        st.sidebar.success("Vector Database: Pinecone Active")
+        if st.session_state.document_processed:
+            st.sidebar.success("Document: Processed and Ready")
+        else:
+            st.sidebar.info("Document: No document uploaded")
+    else:
+        st.sidebar.error("Pinecone Initialization Failed")
+    
+    # LM Studio status check
+    try:
+        response = requests.get("http://127.0.0.1:1234/", timeout=2)
+        if response.status_code == 200:
+            st.sidebar.success("LM Studio: Connected (Llama 3.2 3B)")
+        else:
+            st.sidebar.warning("LM Studio: Server running but model not loaded")
+    except:
+        st.sidebar.error("LM Studio: Not connected")
+        st.sidebar.info("Please ensure LM Studio is running with Llama 3.2 3B model loaded")
+    
+    # Agent list in sidebar
+    st.sidebar.markdown("### Active Agents")
+    for agent in agents_info:
+        st.sidebar.write(f"• {agent['name']}: {agent['role']}")
+    
+    dashboard_section = st.sidebar.selectbox(
+        "Select Dashboard Section",
+        ["Executive Overview", "Risk Analysis", "Training Plans", "Agent Status", "RAG Query Interface", "Document Upload", "Knowledge Graph", "Agentic AI Workflow"]
+    )
+    
+    if df is not None:
+        st.sidebar.markdown("### Dataset Information")
+        st.sidebar.metric("Total Employees", f"{len(df):,}")
+        st.sidebar.metric("Departments", df['Department'].nunique())
+        st.sidebar.metric("Job Roles", df['JobRole'].nunique())
+    else:
+        st.sidebar.markdown("### Dataset Information")
+        st.sidebar.error("No enterprise data loaded")
+        st.sidebar.info("Upload documents to analyze")
+    
+    # Main content based on selection
+    if dashboard_section == "Executive Overview":
+        show_executive_overview(df, metrics)
+    elif dashboard_section == "Risk Analysis":
+        show_risk_analysis(df, metrics)
+    elif dashboard_section == "Training Plans":
+        show_training_plans(df, metrics)
+    elif dashboard_section == "Agent Status":
+        show_agent_status(df)
+    elif dashboard_section == "RAG Query Interface":
+        show_rag_interface_updated()
+    elif dashboard_section == "Document Upload":
+        show_document_upload_updated()
+    elif dashboard_section == "Knowledge Graph":
+        show_knowledge_graph()   
+    elif dashboard_section == "Agentic AI Workflow":
+        show_agentic_ai_interface()
+
+    # Add the new dashboard tabs for HR insights
+    st.markdown("---")
+    tab1, tab2, tab3 = st.tabs(["Main Dashboard", "Recruitment Hub", "Training Center"])
+
+    with tab2:
+        st.header("Recruitment Intelligence Hub")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Open Positions", "5", "+2")
+        with col2:
+            st.metric("Candidates Sourced", "23", "+8")
+        with col3:
+            st.metric("Time to Hire", "18 days", "-5")
+        
+        if st.session_state.workflow_results:
+            latest_result = st.session_state.workflow_results[-1]
+            if "recruitment_proposals" in latest_result:
+                st.subheader("Latest Recruitment Proposals")
+                st.json(latest_result["recruitment_proposals"])
+
+    with tab3:
+        st.header("Training & Development Center")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Active Programs", "12", "+3")
+        with col2:
+            st.metric("Employees Enrolled", "45", "+15")
+        with col3:
+            st.metric("Completion Rate", "87%", "+5%")
+        
+        if st.session_state.workflow_results:
+            latest_result = st.session_state.workflow_results[-1]
+            if "training_proposals" in latest_result:
+                st.subheader("Latest Training Proposals")
+                st.json(latest_result["training_proposals"])
 
 if __name__ == "__main__":
     main()
