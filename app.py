@@ -129,7 +129,7 @@ def initialize_pinecone():
 def extract_pdf_text(uploaded_file):
     """Extract text from PDF file"""
     try:
-        pdf_reader = PyPDF2.PdfReader(uploaded_file)
+        pdf_reader = PdfReader(uploaded_file)
         text = ""
         for page in pdf_reader.pages:
             text += page.extract_text() + "\n"
