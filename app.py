@@ -15,6 +15,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import requests
 import PyPDF2
+from pypdf import PdfReader
 import docx
 from io import BytesIO
 import tempfile
