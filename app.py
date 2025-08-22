@@ -100,7 +100,7 @@ if 'entities' not in st.session_state:
 def initialize_pinecone():
     """Initialize Pinecone vector database"""
     try:
-    pc = Pinecone(
+        pc = Pinecone(
         api_key=os.getenv("PINECONE_API_KEY", "pcsk_3CwtHw_9Zw6NTWL64SryXCZLLS8BreatEH46i5uJLCm6F5jwYpnS93WsT4DWN2roYaXnCC")
     )
         
