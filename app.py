@@ -21,7 +21,7 @@ import tempfile
 import os
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import Pinecone
-from pinecone import Pinecone
+import pinecone
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 import json
